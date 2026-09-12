@@ -512,7 +512,7 @@ jobs:
           "$tools_dir/linuxdeploy-${arch}.AppImage" --appimage-extract-and-run --version
 
       - name: Build with Tauri
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_ID: ${{ inputs.sign-binaries && secrets.APPLE_ID || '' }}
