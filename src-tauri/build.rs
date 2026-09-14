@@ -34,7 +34,18 @@ fn main() {
     // Must run after transcribe staging because that helper recreates transcribe-libs/.
     stage_vc_runtime_dlls();
 
-    tauri_build::build()
+    tauri_build::build();
+
+    // Native Windows library tests explicitly link the same manifest resource
+    // as the app. Make it discoverable without changing production link inputs.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
+        println!(
+            "cargo:rustc-link-search=native={}",
+            std::env::var("OUT_DIR").expect("Cargo provides OUT_DIR")
+        );
+    }
 }
 
 /// Stage the MSVC runtime DLLs into `transcribe-libs/` for app-local deployment.

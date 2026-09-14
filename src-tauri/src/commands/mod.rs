@@ -178,14 +178,15 @@ pub struct ShortcutsInitialized;
 #[specta::specta]
 #[tauri::command]
 pub fn initialize_shortcuts(app: AppHandle) -> Result<(), String> {
-    // Check if already initialized
+    // Serialize initialization with all native shortcut mutations, including retries.
+    let _permit = crate::shortcut::runtime::admit(&app)?;
     if app.try_state::<ShortcutsInitialized>().is_some() {
         log::debug!("Shortcuts already initialized");
         return Ok(());
     }
 
     // Initialize shortcuts
-    crate::shortcut::init_shortcuts(&app);
+    crate::shortcut::init_shortcuts(&app)?;
 
     // Mark as initialized before reconciling the macOS Secure Input fallback.
     app.manage(ShortcutsInitialized);

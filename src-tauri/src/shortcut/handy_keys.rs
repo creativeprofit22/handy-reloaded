@@ -42,6 +42,37 @@ use crate::settings::{self, get_settings, ShortcutBinding};
 
 use super::handler::handle_shortcut_event;
 
+/// Actual manager ownership, never reconstructed from the selected settings.
+pub(crate) fn snapshot(app: &AppHandle) -> Result<Vec<super::switch::Registration>, String> {
+    use super::switch::{Registration, Role};
+    let Some(state) = app.try_state::<HandyKeysState>() else {
+        return Ok(Vec::new());
+    };
+    state
+        .snapshot()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|(id, text)| {
+            let role = if id == "cancel" {
+                Role::Cancel
+            } else {
+                Role::Primary
+            };
+            Registration::new(
+                settings::KeyboardImplementation::HandyKeys,
+                ShortcutBinding {
+                    name: id.clone(),
+                    description: String::new(),
+                    id,
+                    current_binding: text.clone(),
+                    default_binding: text,
+                },
+                role,
+            )
+        })
+        .collect()
+}
+
 /// Commands that can be sent to the hotkey manager thread
 enum ManagerCommand {
     Register {
@@ -52,6 +83,9 @@ enum ManagerCommand {
     Unregister {
         binding_id: String,
         response: Sender<Result<(), String>>,
+    },
+    Snapshot {
+        response: Sender<Vec<(String, String)>>,
     },
     Shutdown,
 }
@@ -64,12 +98,9 @@ pub struct HandyKeysState {
     thread_handle: Mutex<Option<JoinHandle<()>>>,
     /// Recording listener for UI key capture (only active during recording)
     recording_listener: Mutex<Option<KeyboardListener>>,
-    /// Flag indicating if we're in recording mode
-    is_recording: AtomicBool,
-    /// The binding ID being recorded (if any)
-    recording_binding_id: Mutex<Option<String>>,
-    /// Flag to stop recording loop
-    recording_running: Arc<AtomicBool>,
+    /// Capture worker and its suspension debt, independent of the active backend.
+    capture: Mutex<super::capture::Session>,
+    uncertain: Mutex<Vec<ShortcutBinding>>,
 }
 
 /// Key event sent to frontend during recording mode
@@ -85,6 +116,179 @@ pub struct FrontendKeyEvent {
     pub hotkey_string: String,
 }
 
+// The native manager is created and retained on its owning thread; T need not
+// be Send. Only readiness and commands cross the thread boundary.
+fn start_manager_thread<T: 'static>(
+    initialize: impl FnOnce() -> Result<T, String> + Send + 'static,
+    run: impl FnOnce(T) + Send + 'static,
+) -> Result<JoinHandle<()>, String> {
+    let (ready, readiness) = mpsc::channel();
+    let thread = thread::Builder::new()
+        .name("handy-keys-manager".into())
+        .spawn(move || match initialize() {
+            Ok(manager) => {
+                if ready.send(Ok(())).is_ok() {
+                    run(manager);
+                }
+            }
+            Err(error) => {
+                let _ = ready.send(Err(error));
+            }
+        })
+        .map_err(|e| format!("Failed to start shortcut manager thread: {e}"))?;
+    match readiness.recv() {
+        Ok(Ok(())) => Ok(thread),
+        result => {
+            let _ = thread.join();
+            Err(match result {
+                Ok(Err(error)) => error,
+                _ => "Shortcut manager stopped before reporting readiness".into(),
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+
+    #[test]
+    fn initialization_failure_is_returned_to_the_switch_owner() {
+        let result = start_manager_thread::<()>(
+            || Err("native backend unavailable".into()),
+            |_| panic!("failed initialization must never enter the event loop"),
+        );
+        // Join even under the old behavior so a failed regression leaves no thread.
+        let error = match result {
+            Ok(thread) => {
+                thread.join().unwrap();
+                None
+            }
+            Err(error) => Some(error),
+        };
+        assert_eq!(error.as_deref(), Some("native backend unavailable"));
+    }
+
+    #[test]
+    fn initialization_panic_is_not_reported_as_success() {
+        let result = start_manager_thread::<()>(
+            || panic!("injected startup panic"),
+            |_| panic!("must not run"),
+        );
+        match result {
+            Ok(thread) => {
+                let _ = thread.join();
+                panic!("startup reported success");
+            }
+            Err(error) => assert!(error.contains("before reporting readiness")),
+        }
+    }
+
+    #[test]
+    fn native_state_is_created_and_used_on_the_same_thread() {
+        let (sender, receiver) = mpsc::channel();
+        let thread = start_manager_thread(
+            || Ok((std::rc::Rc::new(42), thread::current().id())),
+            move |(value, owner)| {
+                sender
+                    .send((*value, owner == thread::current().id()))
+                    .unwrap();
+            },
+        )
+        .unwrap();
+        assert_eq!(receiver.recv().unwrap(), (42, true));
+        thread.join().unwrap();
+    }
+}
+
+/// Keep both ownership indexes unchanged unless the native mutation succeeds.
+fn register_owned<H: Copy + Eq + std::hash::Hash>(
+    forward: &mut HashMap<String, H>,
+    reverse: &mut HashMap<H, (String, String)>,
+    binding_id: &str,
+    hotkey_string: &str,
+    native: impl FnOnce() -> Result<H, String>,
+) -> Result<(), String> {
+    if forward.contains_key(binding_id) {
+        return Err(format!(
+            "Binding '{binding_id}' already owns a native shortcut"
+        ));
+    }
+    let handle = native()?;
+    forward.insert(binding_id.to_owned(), handle);
+    reverse.insert(handle, (binding_id.to_owned(), hotkey_string.to_owned()));
+    Ok(())
+}
+
+fn unregister_owned<H: Copy + Eq + std::hash::Hash>(
+    forward: &mut HashMap<String, H>,
+    reverse: &mut HashMap<H, (String, String)>,
+    binding_id: &str,
+    native: impl FnOnce(H) -> Result<(), String>,
+) -> Result<(), String> {
+    if let Some(handle) = forward.get(binding_id).copied() {
+        native(handle)?;
+        forward.remove(binding_id);
+        reverse.remove(&handle);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    #[test]
+    fn failed_removal_keeps_both_indexes_and_can_be_retried() {
+        let mut forward = HashMap::new();
+        let mut reverse = HashMap::new();
+        register_owned(&mut forward, &mut reverse, "a", "ctrl+a", || Ok(7_u32)).unwrap();
+        assert!(unregister_owned(&mut forward, &mut reverse, "a", |_| Err(
+            "native failure".into()
+        ))
+        .is_err());
+        assert_eq!(forward.get("a"), Some(&7));
+        assert_eq!(reverse.get(&7), Some(&("a".into(), "ctrl+a".into())));
+        unregister_owned(&mut forward, &mut reverse, "a", |handle| {
+            assert_eq!(handle, 7);
+            Ok(())
+        })
+        .unwrap();
+        assert!(forward.is_empty());
+        assert!(reverse.is_empty());
+    }
+
+    #[test]
+    fn duplicate_callback_id_never_calls_native_or_replaces_handle() {
+        let mut forward = HashMap::new();
+        let mut reverse = HashMap::new();
+        register_owned(&mut forward, &mut reverse, "a", "ctrl+a", || Ok(7_u32)).unwrap();
+        assert!(
+            register_owned(&mut forward, &mut reverse, "a", "ctrl+b", || panic!(
+                "must reject before native registration"
+            ))
+            .is_err()
+        );
+        assert_eq!(forward.get("a"), Some(&7));
+        assert_eq!(reverse.len(), 1);
+        assert_eq!(reverse[&7].1, "ctrl+a");
+    }
+
+    #[test]
+    fn rejected_installation_changes_neither_index() {
+        let mut forward = HashMap::<String, u32>::new();
+        let mut reverse = HashMap::new();
+        assert!(
+            register_owned(&mut forward, &mut reverse, "a", "ctrl+a", || Err(
+                "occupied".into()
+            ))
+            .is_err()
+        );
+        assert!(forward.is_empty());
+        assert!(reverse.is_empty());
+    }
+}
+
 impl HandyKeysState {
     /// Create a new HandyKeysState
     pub fn new(app: AppHandle) -> Result<Self, String> {
@@ -92,32 +296,23 @@ impl HandyKeysState {
 
         // Start the manager thread
         let app_clone = app.clone();
-        let thread_handle = thread::spawn(move || {
-            Self::manager_thread(cmd_rx, app_clone);
-        });
+        let thread_handle = start_manager_thread(
+            || HotkeyManager::new_with_blocking().map_err(|e| e.to_string()),
+            move |manager| Self::manager_thread(cmd_rx, app_clone, manager),
+        )?;
 
         Ok(Self {
             command_sender: Mutex::new(cmd_tx),
             thread_handle: Mutex::new(Some(thread_handle)),
             recording_listener: Mutex::new(None),
-            is_recording: AtomicBool::new(false),
-            recording_binding_id: Mutex::new(None),
-            recording_running: Arc::new(AtomicBool::new(false)),
+            capture: Mutex::new(super::capture::Session::default()),
+            uncertain: Mutex::new(Vec::new()),
         })
     }
 
     /// The main manager thread - owns the HotkeyManager and processes commands
-    fn manager_thread(cmd_rx: Receiver<ManagerCommand>, app: AppHandle) {
+    fn manager_thread(cmd_rx: Receiver<ManagerCommand>, app: AppHandle, manager: HotkeyManager) {
         info!("handy-keys manager thread started");
-
-        // Create the HotkeyManager in this thread
-        let manager = match HotkeyManager::new_with_blocking() {
-            Ok(m) => m,
-            Err(e) => {
-                error!("Failed to create HotkeyManager: {}", e);
-                return;
-            }
-        };
 
         // Maps binding IDs to HotkeyIds and hotkey strings
         let mut binding_to_hotkey: HashMap<String, HotkeyId> = HashMap::new();
@@ -165,6 +360,11 @@ impl HandyKeysState {
                         );
                         let _ = response.send(result);
                     }
+                    ManagerCommand::Snapshot { response } => {
+                        let mut bindings: Vec<_> = hotkey_to_binding.values().cloned().collect();
+                        bindings.sort_by(|left, right| left.0.cmp(&right.0));
+                        let _ = response.send(bindings);
+                    }
                     ManagerCommand::Shutdown => {
                         info!("handy-keys manager thread shutting down");
                         break;
@@ -195,12 +395,17 @@ impl HandyKeysState {
             .parse()
             .map_err(|e| format!("Failed to parse hotkey '{}': {}", hotkey_string, e))?;
 
-        let id = manager
-            .register(hotkey)
-            .map_err(|e| format!("Failed to register hotkey: {}", e))?;
-
-        binding_to_hotkey.insert(binding_id.to_string(), id);
-        hotkey_to_binding.insert(id, (binding_id.to_string(), hotkey_string.to_string()));
+        register_owned(
+            binding_to_hotkey,
+            hotkey_to_binding,
+            binding_id,
+            hotkey_string,
+            || {
+                manager
+                    .register(hotkey)
+                    .map_err(|e| format!("Failed to register hotkey: {e}"))
+            },
+        )?;
 
         debug!(
             "Registered handy-keys shortcut: {} -> {:?}",
@@ -216,86 +421,162 @@ impl HandyKeysState {
         hotkey_to_binding: &mut HashMap<HotkeyId, (String, String)>,
         binding_id: &str,
     ) -> Result<(), String> {
-        if let Some(id) = binding_to_hotkey.remove(binding_id) {
+        unregister_owned(binding_to_hotkey, hotkey_to_binding, binding_id, |id| {
             manager
                 .unregister(id)
-                .map_err(|e| format!("Failed to unregister hotkey: {}", e))?;
-            hotkey_to_binding.remove(&id);
-            debug!("Unregistered handy-keys shortcut: {}", binding_id);
-        }
-        Ok(())
+                .map_err(|e| format!("Failed to unregister hotkey: {e}"))
+        })
     }
 
     /// Register a shortcut binding
     pub fn register(&self, binding: &ShortcutBinding) -> Result<(), String> {
+        self.register_report(binding)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn register_report(
+        &self,
+        binding: &ShortcutBinding,
+    ) -> Result<(), super::switch::NativeFailure> {
+        use super::switch::NativeFailure;
+        if !self
+            .uncertain
+            .lock()
+            .map_err(|_| {
+                NativeFailure::Indeterminate("HandyKeys uncertainty lock poisoned".into())
+            })?
+            .is_empty()
+        {
+            return Err(NativeFailure::Indeterminate(
+                "HandyKeys has unresolved native ownership; restart required".into(),
+            ));
+        }
         let (tx, rx) = mpsc::channel();
         self.command_sender
             .lock()
-            .map_err(|_| "Failed to lock command_sender")?
+            .map_err(|_| NativeFailure::Rejected("Failed to lock command_sender".into()))?
             .send(ManagerCommand::Register {
                 binding_id: binding.id.clone(),
                 hotkey_string: binding.current_binding.clone(),
                 response: tx,
             })
-            .map_err(|_| "Failed to send register command")?;
+            .map_err(|_| NativeFailure::Rejected("Failed to send register command".into()))?;
 
         rx.recv()
-            .map_err(|_| "Failed to receive register response")?
+            .map_err(|_| {
+                if let Ok(mut uncertain) = self.uncertain.lock() {
+                    uncertain.push(binding.clone());
+                }
+                NativeFailure::Indeterminate("Failed to receive register response".into())
+            })?
+            .map_err(NativeFailure::Rejected)
     }
 
     /// Unregister a shortcut binding
     pub fn unregister(&self, binding: &ShortcutBinding) -> Result<(), String> {
+        self.unregister_report(binding)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn unregister_report(
+        &self,
+        binding: &ShortcutBinding,
+    ) -> Result<(), super::switch::NativeFailure> {
+        use super::switch::NativeFailure;
+        if !self
+            .uncertain
+            .lock()
+            .map_err(|_| {
+                NativeFailure::Indeterminate("HandyKeys uncertainty lock poisoned".into())
+            })?
+            .is_empty()
+        {
+            return Err(NativeFailure::Indeterminate(
+                "HandyKeys has unresolved native ownership; restart required".into(),
+            ));
+        }
         let (tx, rx) = mpsc::channel();
         self.command_sender
             .lock()
-            .map_err(|_| "Failed to lock command_sender")?
+            .map_err(|_| NativeFailure::Rejected("Failed to lock command_sender".into()))?
             .send(ManagerCommand::Unregister {
                 binding_id: binding.id.clone(),
                 response: tx,
             })
-            .map_err(|_| "Failed to send unregister command")?;
+            .map_err(|_| NativeFailure::Rejected("Failed to send unregister command".into()))?;
 
         rx.recv()
-            .map_err(|_| "Failed to receive unregister response")?
+            .map_err(|_| {
+                if let Ok(mut uncertain) = self.uncertain.lock() {
+                    uncertain.push(binding.clone());
+                }
+                NativeFailure::Indeterminate("Failed to receive unregister response".into())
+            })?
+            .map_err(NativeFailure::Rejected)
     }
 
-    /// Start recording mode for a specific binding
-    pub fn start_recording(&self, app: &AppHandle, binding_id: String) -> Result<(), String> {
-        if self.is_recording.load(Ordering::SeqCst) {
-            return Err("Already recording".into());
-        }
-
-        // Create a new keyboard listener for recording
-        let listener = KeyboardListener::new()
-            .map_err(|e| format!("Failed to create keyboard listener: {}", e))?;
-
+    /// Snapshot actual manager-owned registrations, ordered by callback ID.
+    /// A lost response is not equivalent to an empty registration set.
+    pub(crate) fn snapshot(&self) -> Result<Vec<(String, String)>, super::switch::NativeFailure> {
+        use super::switch::NativeFailure;
+        if !self
+            .uncertain
+            .lock()
+            .map_err(|_| {
+                NativeFailure::Indeterminate("HandyKeys uncertainty lock poisoned".into())
+            })?
+            .is_empty()
         {
-            let mut recording = self
-                .recording_listener
-                .lock()
-                .map_err(|_| "Failed to lock recording_listener")?;
-            *recording = Some(listener);
+            return Err(NativeFailure::Indeterminate(
+                "HandyKeys has unresolved native ownership; restart required".into(),
+            ));
         }
-        {
-            let mut binding = self
-                .recording_binding_id
-                .lock()
-                .map_err(|_| "Failed to lock recording_binding_id")?;
-            *binding = Some(binding_id);
-        }
+        let (tx, rx) = mpsc::channel();
+        self.command_sender
+            .lock()
+            .map_err(|_| NativeFailure::Indeterminate("Shortcut manager sender poisoned".into()))?
+            .send(ManagerCommand::Snapshot { response: tx })
+            .map_err(|_| {
+                NativeFailure::Indeterminate("Shortcut manager unavailable for snapshot".into())
+            })?;
+        rx.recv().map_err(|_| {
+            NativeFailure::Indeterminate("Shortcut manager snapshot response lost".into())
+        })
+    }
 
-        self.is_recording.store(true, Ordering::SeqCst);
-        self.recording_running.store(true, Ordering::SeqCst);
-
-        // Start a thread to emit key events to the frontend
-        let app_clone = app.clone();
-        let recording_running = Arc::clone(&self.recording_running);
-        thread::spawn(move || {
-            Self::recording_loop(app_clone, recording_running);
-        });
-
-        debug!("Started handy-keys recording mode");
-        Ok(())
+    /// Caller holds shortcut admission. Native construction/disposal stays on
+    /// the command path; only polling runs on the session-specific worker.
+    fn start_recording(&self, app: &AppHandle) -> Result<(), String> {
+        self.capture
+            .lock()
+            .map_err(|_| "Capture session lock poisoned")?
+            .start(
+                || {
+                    if super::runtime::intent(app)?.1 {
+                        return Err("Another shortcut editor owns capture suspension".into());
+                    }
+                    super::runtime::capture_admitted(app, true)
+                },
+                || {
+                    let listener = KeyboardListener::new()
+                        .map_err(|e| format!("Failed to create keyboard listener: {e}"))?;
+                    *self
+                        .recording_listener
+                        .lock()
+                        .map_err(|_| "Failed to lock recording_listener")? = Some(listener);
+                    let app = app.clone();
+                    match super::capture::Worker::spawn(move |running| {
+                        Self::recording_loop(app, running)
+                    }) {
+                        Ok(worker) => Ok(worker),
+                        Err(error) => {
+                            self.dispose_recording_listener()?;
+                            Err(error)
+                        }
+                    }
+                },
+                || super::runtime::capture_admitted(app, false),
+            )
     }
 
     /// Recording loop - emits key events to frontend during recording
@@ -334,36 +615,36 @@ impl HandyKeysState {
         debug!("Recording loop ended");
     }
 
-    /// Stop recording mode
-    pub fn stop_recording(&self) -> Result<(), String> {
-        self.is_recording.store(false, Ordering::SeqCst);
-        self.recording_running.store(false, Ordering::SeqCst);
-
-        {
-            let mut recording = self
-                .recording_listener
-                .lock()
-                .map_err(|_| "Failed to lock recording_listener")?;
-            *recording = None;
-        }
-        {
-            let mut binding = self
-                .recording_binding_id
-                .lock()
-                .map_err(|_| "Failed to lock recording_binding_id")?;
-            *binding = None;
-        }
-
-        debug!("Stopped handy-keys recording mode");
+    fn dispose_recording_listener(&self) -> Result<(), String> {
+        *self
+            .recording_listener
+            .lock()
+            .map_err(|_| "Failed to lock recording_listener")? = None;
         Ok(())
+    }
+
+    /// Join without holding the listener mutex needed by the worker, then
+    /// restore only the suspension acquired by this HandyKeys session.
+    fn stop_recording(&self, app: &AppHandle) -> Result<(), String> {
+        self.capture
+            .lock()
+            .map_err(|_| "Capture session lock poisoned")?
+            .stop(
+                || self.dispose_recording_listener(),
+                || super::runtime::capture_admitted(app, false),
+            )
     }
 }
 
 impl Drop for HandyKeysState {
     fn drop(&mut self) {
-        // Signal recording to stop
-        self.recording_running.store(false, Ordering::SeqCst);
-        self.is_recording.store(false, Ordering::SeqCst);
+        // Join capture before dropping its native listener. No listener lock is
+        // held here and the worker never takes the capture-session lock.
+        if let Ok(capture) = self.capture.get_mut() {
+            if let Err(error) = capture.stop(|| Ok(()), || Ok(())) {
+                error!("Failed to stop capture on shutdown: {error}");
+            }
+        }
 
         // Send shutdown command
         if let Ok(sender) = self.command_sender.lock() {
@@ -421,85 +702,25 @@ pub fn validate_shortcut(raw: &str) -> Result<(), String> {
         .map_err(|e| format!("Invalid shortcut for HandyKeys: {}", e))
 }
 
-/// Initialize handy-keys shortcuts
-pub fn init_shortcuts(app: &AppHandle) -> Result<(), String> {
-    let state = HandyKeysState::new(app.clone())?;
-
-    let default_bindings = settings::get_default_settings().bindings;
-    let user_settings = settings::load_or_create_app_settings(app);
-
-    // Register all bindings except cancel (which is dynamic)
-    for (id, default_binding) in default_bindings {
-        if id == "cancel" {
-            continue;
-        }
-        // Skip post-processing shortcut when the feature is disabled
-        if id == "transcribe_with_post_process" && !user_settings.post_process_enabled {
-            continue;
-        }
-
-        let binding = user_settings
-            .bindings
-            .get(&id)
-            .cloned()
-            .unwrap_or(default_binding);
-
-        if let Err(e) = state.register(&binding) {
-            error!(
-                "Failed to register handy-keys shortcut {} during init: {}",
-                id, e
-            );
-        }
+/// Initialize the backend without registering bindings or writing settings.
+/// Runtime switching uses this before removing the previous registrations.
+pub(super) fn ensure_initialized(app: &AppHandle) -> Result<(), String> {
+    if app.try_state::<HandyKeysState>().is_none() {
+        let state = HandyKeysState::new(app.clone())?;
+        app.manage(state);
     }
-
-    app.manage(state);
-    info!("handy-keys shortcuts initialized");
     Ok(())
 }
 
-/// Register the cancel shortcut (called when recording starts)
+/// Request cancel through the shared lifecycle, never a backend-local async job.
+/// Ownership and Linux exclusion are resolved by the admitted reconciler.
 pub fn register_cancel_shortcut(app: &AppHandle) {
-    // Disabled on Linux due to instability
-    #[cfg(target_os = "linux")]
-    {
-        let _ = app;
-        return;
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        let app_clone = app.clone();
-        tauri::async_runtime::spawn(async move {
-            if let Some(cancel_binding) = get_settings(&app_clone).bindings.get("cancel").cloned() {
-                if let Some(state) = app_clone.try_state::<HandyKeysState>() {
-                    if let Err(e) = state.register(&cancel_binding) {
-                        error!("Failed to register cancel shortcut: {}", e);
-                    }
-                }
-            }
-        });
-    }
+    super::register_cancel_shortcut(app);
 }
 
-/// Unregister the cancel shortcut (called when recording stops)
+/// Remove cancel from its actual owner, even after a backend switch.
 pub fn unregister_cancel_shortcut(app: &AppHandle) {
-    #[cfg(target_os = "linux")]
-    {
-        let _ = app;
-        return;
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        let app_clone = app.clone();
-        tauri::async_runtime::spawn(async move {
-            if let Some(cancel_binding) = get_settings(&app_clone).bindings.get("cancel").cloned() {
-                if let Some(state) = app_clone.try_state::<HandyKeysState>() {
-                    let _ = state.unregister(&cancel_binding);
-                }
-            }
-        });
-    }
+    super::unregister_cancel_shortcut(app);
 }
 
 /// Register a shortcut
@@ -522,6 +743,7 @@ pub fn unregister_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<
 #[tauri::command]
 #[specta::specta]
 pub fn start_handy_keys_recording(app: AppHandle, binding_id: String) -> Result<(), String> {
+    let _permit = super::runtime::admit(&app)?;
     let settings = get_settings(&app);
     if settings.keyboard_implementation != settings::KeyboardImplementation::HandyKeys {
         return Err("handy-keys is not the active keyboard implementation".into());
@@ -541,34 +763,55 @@ pub fn start_handy_keys_recording(app: AppHandle, binding_id: String) -> Result<
         .try_state::<HandyKeysState>()
         .ok_or("HandyKeysState not initialized")?;
 
-    // Suspend every registered shortcut so a combo that overlaps an existing
-    // binding can't fire it (or have its keys swallowed) mid-capture.
-    super::suspend_all_shortcuts(&app);
-
-    let result = state.start_recording(&app, binding_id);
-    if result.is_err() {
-        super::resume_all_shortcuts(&app);
+    if !settings.bindings.contains_key(&binding_id) {
+        return Err("Unknown shortcut binding".into());
     }
-    result
+    state.start_recording(&app)
 }
 
 /// Stop key recording mode
 #[tauri::command]
 #[specta::specta]
 pub fn stop_handy_keys_recording(app: AppHandle) -> Result<(), String> {
-    let settings = get_settings(&app);
-    if settings.keyboard_implementation != settings::KeyboardImplementation::HandyKeys {
-        return Err("handy-keys is not the active keyboard implementation".into());
+    // A completed switch has already disposed this session. In particular, a
+    // stale editor's unmount must not touch a new Tauri editor's suspension.
+    if !owns_capture_suspension(&app)? {
+        return Ok(());
     }
+    let _permit = super::runtime::admit_cleanup(&app)?;
+    stop_recording_admitted(&app)
+}
 
-    let state = app
-        .try_state::<HandyKeysState>()
-        .ok_or("HandyKeysState not initialized")?;
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) fn assert_capture_stopped(app: &AppHandle) {
+    let state = app.state::<HandyKeysState>();
+    let capture = state.capture.lock().unwrap();
+    assert!(!capture.owns_suspension());
+    assert!(!capture.has_worker());
+    assert!(state.recording_listener.lock().unwrap().is_none());
+}
 
-    // Restore shortcuts from settings regardless of how recording ended.
-    // A commit has already registered the new binding via change_binding;
-    // re-registering it here fails cleanly and is ignored.
-    let result = state.stop_recording();
-    super::resume_all_shortcuts(&app);
-    result
+pub(crate) fn owns_capture_suspension(app: &AppHandle) -> Result<bool, String> {
+    match app.try_state::<HandyKeysState>() {
+        // Public stop can reach this before admission. Never block the IPC
+        // thread behind a switch whose native work may need that same thread.
+        Some(state) => Ok(state
+            .capture
+            .try_lock()
+            .map_err(|error| match error {
+                std::sync::TryLockError::WouldBlock => "Keyboard operation busy; retry when it completes",
+                std::sync::TryLockError::Poisoned(_) => "Capture session lock poisoned",
+            })?
+            .owns_suspension()),
+        None => Ok(false),
+    }
+}
+
+/// Used by public stop and the admitted switch transaction before taking its
+/// registration snapshot. No selected-backend check belongs on termination.
+pub(crate) fn stop_recording_admitted(app: &AppHandle) -> Result<(), String> {
+    match app.try_state::<HandyKeysState>() {
+        Some(state) => state.stop_recording(app),
+        None => Ok(()),
+    }
 }

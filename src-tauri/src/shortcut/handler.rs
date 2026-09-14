@@ -13,6 +13,11 @@ use crate::settings::get_settings;
 use crate::transcription_coordinator::is_transcribe_binding;
 use crate::TranscriptionCoordinator;
 
+// Native integration tests observe delivery without starting recording or reading
+// the user's settings. This hook does not exist in production builds.
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) struct NativeEventProbe(pub std::sync::mpsc::Sender<(String, bool)>);
+
 /// Handle a shortcut event from either implementation.
 ///
 /// This function contains the shared logic for:
@@ -32,6 +37,18 @@ pub fn handle_shortcut_event(
     hotkey_string: &str,
     is_pressed: bool,
 ) {
+    // Native callbacks can already be queued when unregistration succeeds.
+    // Keep the dynamic cancel exemption, but never dispatch stale capture input.
+    if binding_id != "cancel"
+        && !matches!(super::runtime::intent(app), Ok((_, false)))
+    {
+        return;
+    }
+    #[cfg(all(test, target_os = "windows"))]
+    if let Some(probe) = app.try_state::<NativeEventProbe>() {
+        let _ = probe.0.send((binding_id.to_owned(), is_pressed));
+        return;
+    }
     let settings = get_settings(app);
 
     // Transcribe bindings are handled by the coordinator.
