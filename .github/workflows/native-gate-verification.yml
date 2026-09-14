@@ -1,0 +1,66 @@
+# Disposable verification harness: never calls the release or packaging workflows.
+name: Native gate verification (no publishing)
+
+on:
+  push:
+    branches:
+      - verify/native-shortcut-gate-20260914
+      - verify/native-shortcut-gate-failure-20260914
+
+permissions:
+  contents: read
+
+jobs:
+  verify-rust:
+    uses: ./.github/workflows/test.yml
+
+  verify-frontend:
+    uses: ./.github/workflows/ci.yml
+
+  # Same dependency conditions as release.yml; harmless stand-ins only.
+  create-release:
+    needs: [verify-rust, verify-frontend]
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "Release preparation would be admitted; no release is created."
+
+  publish-tauri:
+    needs: [verify-rust, verify-frontend, create-release]
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "Packaging would be admitted; nothing is built or published."
+
+  record-gating-result:
+    if: always()
+    needs: [verify-rust, verify-frontend, create-release, publish-tauri]
+    runs-on: ubuntu-24.04
+    env:
+      TESTED_REVISION: ${{ github.sha }}
+      TESTED_REF: ${{ github.ref_name }}
+      RUST_RESULT: ${{ needs.verify-rust.result }}
+      FRONTEND_RESULT: ${{ needs.verify-frontend.result }}
+      PREPARATION_RESULT: ${{ needs.create-release.result }}
+      PACKAGING_RESULT: ${{ needs.publish-tauri.result }}
+    steps:
+      - name: Record and assert dependency outcomes
+        shell: bash
+        run: |
+          {
+            printf '### Non-publishing release gate verification\n\n'
+            printf -- '- Revision: `%s`\n' "$TESTED_REVISION"
+            printf -- '- Branch: `%s`\n' "$TESTED_REF"
+            printf -- '- Rust: `%s`\n' "$RUST_RESULT"
+            printf -- '- Frontend: `%s`\n' "$FRONTEND_RESULT"
+            printf -- '- Preparation stand-in: `%s`\n' "$PREPARATION_RESULT"
+            printf -- '- Packaging stand-in: `%s`\n' "$PACKAGING_RESULT"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$FRONTEND_RESULT" = success
+          if [[ "$TESTED_REF" == verify/native-shortcut-gate-failure-20260914 ]]; then
+            test "$RUST_RESULT" = failure
+            test "$PREPARATION_RESULT" = skipped
+            test "$PACKAGING_RESULT" = skipped
+          else
+            test "$RUST_RESULT" = success
+            test "$PREPARATION_RESULT" = success
+            test "$PACKAGING_RESULT" = success
+          fi

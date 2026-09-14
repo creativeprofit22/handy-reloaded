@@ -262,7 +262,6 @@ mod ownership_tests {
     }
 }
 
-
 /// Validate a shortcut string for the Tauri global-shortcut implementation.
 /// Tauri requires at least one non-modifier key and doesn't support the fn key.
 pub fn validate_shortcut(raw: &str) -> Result<(), String> {

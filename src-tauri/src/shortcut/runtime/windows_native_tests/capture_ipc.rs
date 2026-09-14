@@ -103,13 +103,22 @@ pub(super) fn exercise(app: &AppHandle) {
     .build()
     .unwrap();
 
-    for expected in ["recording", "stopped", "tauri-editor", "restarted", "finished"] {
+    for expected in [
+        "recording",
+        "stopped",
+        "tauri-editor",
+        "restarted",
+        "finished",
+    ] {
         let (stage, proceed) = rx
             .recv_timeout(Duration::from_secs(30))
             .expect("capture IPC checkpoint timed out");
         assert_eq!(stage, expected, "production IPC sequence failed");
         if expected == "tauri-editor" {
-            assert!(intent(app).unwrap().1, "stale HandyKeys stop resumed the Tauri editor's suspension");
+            assert!(
+                intent(app).unwrap().1,
+                "stale HandyKeys stop resumed the Tauri editor's suspension"
+            );
         }
         if matches!(expected, "recording" | "restarted") {
             assert!(handy_keys::owns_capture_suspension(app).unwrap());

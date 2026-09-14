@@ -116,8 +116,16 @@ pub(crate) fn admit(app: &AppHandle) -> Result<Permit, String> {
 /// This does not bypass serialization or permit new native registrations.
 pub(crate) fn admit_cleanup(app: &AppHandle) -> Result<Permit, String> {
     let admission = admission(app);
-    admission.0.lock().map_err(|_| "Keyboard operation state poisoned")?.enter_operation(true)?;
-    Ok(Permit { app: app.clone(), admission, generation: None })
+    admission
+        .0
+        .lock()
+        .map_err(|_| "Keyboard operation state poisoned")?
+        .enter_operation(true)?;
+    Ok(Permit {
+        app: app.clone(),
+        admission,
+        generation: None,
+    })
 }
 
 pub(crate) fn request_reconciliation(app: &AppHandle, cancel: Option<bool>) {
@@ -350,7 +358,14 @@ pub(crate) fn capture_admitted(app: &AppHandle, suspended: bool) -> Result<(), S
         crate::secure_input::reconciliation::coverage(&shadows, &report.owned, &report.uncertain),
     );
     publish_report(app, &report).map_err(|error| {
-        format!("Shortcut {} failed: {error}", if suspended { "suspension" } else { "restoration" })
+        format!(
+            "Shortcut {} failed: {error}",
+            if suspended {
+                "suspension"
+            } else {
+                "restoration"
+            }
+        )
     })?;
     admission(app)
         .0
@@ -371,7 +386,13 @@ fn capture_delta(
     cancel: bool,
     suspended: bool,
     sustained: bool,
-) -> Result<(switch::SwitchReport, crate::secure_input::reconciliation::Plan), String> {
+) -> Result<
+    (
+        switch::SwitchReport,
+        crate::secure_input::reconciliation::Plan,
+    ),
+    String,
+> {
     let primaries = if suspended {
         Vec::new()
     } else {
@@ -801,7 +822,9 @@ mod tests {
         }
     }
     impl CommandOperations for RejectedCommand {
-        fn stop_capture(&mut self) -> Result<(), String> { Ok(()) }
+        fn stop_capture(&mut self) -> Result<(), String> {
+            Ok(())
+        }
         fn settings(&self) -> settings::AppSettings {
             self.current.clone()
         }

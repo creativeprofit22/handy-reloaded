@@ -799,7 +799,9 @@ pub(crate) fn owns_capture_suspension(app: &AppHandle) -> Result<bool, String> {
             .capture
             .try_lock()
             .map_err(|error| match error {
-                std::sync::TryLockError::WouldBlock => "Keyboard operation busy; retry when it completes",
+                std::sync::TryLockError::WouldBlock => {
+                    "Keyboard operation busy; retry when it completes"
+                }
                 std::sync::TryLockError::Poisoned(_) => "Capture session lock poisoned",
             })?
             .owns_suspension()),

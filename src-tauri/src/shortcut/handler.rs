@@ -39,9 +39,7 @@ pub fn handle_shortcut_event(
 ) {
     // Native callbacks can already be queued when unregistration succeeds.
     // Keep the dynamic cancel exemption, but never dispatch stale capture input.
-    if binding_id != "cancel"
-        && !matches!(super::runtime::intent(app), Ok((_, false)))
-    {
+    if binding_id != "cancel" && !matches!(super::runtime::intent(app), Ok((_, false))) {
         return;
     }
     #[cfg(all(test, target_os = "windows"))]

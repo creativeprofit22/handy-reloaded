@@ -107,12 +107,17 @@ impl DesktopHarness {
         let previous = self.snapshot().unwrap();
         let current = self.current.clone();
         let cancel = self.cancel;
-        let (report, shadows) = capture_delta(self, &current, &previous, cancel, suspended, false).unwrap();
+        let (report, shadows) =
+            capture_delta(self, &current, &previous, cancel, suspended, false).unwrap();
         assert!(report.applied(), "{report}");
         self.publish(&report, &shadows).unwrap();
         admission(&self.app).0.lock().unwrap().capture = suspended;
         if suspended {
-            assert!(self.snapshot().unwrap().iter().all(|entry| entry.binding.id == "cancel"));
+            assert!(self
+                .snapshot()
+                .unwrap()
+                .iter()
+                .all(|entry| entry.binding.id == "cancel"));
         }
     }
 
@@ -341,13 +346,23 @@ fn exercise(app: AppHandle, events: Receiver<(String, bool)>) {
 fn windows_native_conflict_rolls_back_and_shortcuts_still_deliver() {
     let mut context = tauri::generate_context!();
     context.config_mut().app.windows.clear();
-    context.config_mut().identifier = format!("com.handy.capture-test-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    context.config_mut().identifier = format!(
+        "com.handy.capture-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
     let app = tauri::Builder::default()
         .any_thread()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_store::Builder::new().build())
         .register_uri_scheme_protocol("capture-test", |_, _| {
-            tauri::http::Response::builder().header("Content-Type", "text/html").body(capture_ipc::HTML.as_bytes().to_vec()).unwrap()
+            tauri::http::Response::builder()
+                .header("Content-Type", "text/html")
+                .body(capture_ipc::HTML.as_bytes().to_vec())
+                .unwrap()
         })
         .invoke_handler(tauri::generate_handler![
             crate::shortcut::handy_keys::start_handy_keys_recording,

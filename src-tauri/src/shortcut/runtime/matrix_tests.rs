@@ -164,8 +164,11 @@ impl Harness {
         let previous = self.metadata.clone();
         let cancel = self.admission.cancel;
         let sustained = self.sustained;
-        let (report, shadows) = capture_delta(self, &current, &previous, cancel, suspended, sustained)?;
-        if !report.applied() { return Err(report.to_string()); }
+        let (report, shadows) =
+            capture_delta(self, &current, &previous, cancel, suspended, sustained)?;
+        if !report.applied() {
+            return Err(report.to_string());
+        }
         self.publish(&report, &shadows)?;
         self.admission.capture = suspended;
         Ok(())
@@ -173,7 +176,13 @@ impl Harness {
     fn start_recording(&mut self) {
         self.admission.enter().unwrap();
         self.set_capture(true).unwrap();
-        self.recording.start(|| Ok(()), || super::super::capture::Worker::spawn(|_| {}), || panic!()).unwrap();
+        self.recording
+            .start(
+                || Ok(()),
+                || super::super::capture::Worker::spawn(|_| {}),
+                || panic!(),
+            )
+            .unwrap();
         self.admission.release(None);
     }
     fn run(&mut self) -> Result<ImplementationChangeResult, String> {
@@ -259,13 +268,16 @@ impl NativeOperations for Harness {
 impl CommandOperations for Harness {
     fn stop_capture(&mut self) -> Result<(), String> {
         let mut recording = std::mem::take(&mut self.recording);
-        let result = recording.stop(|| Ok(()), || {
-            self.capture_restores += 1;
-            if self.fail_capture_restore {
-                return Err("injected capture restore failure".into());
-            }
-            self.set_capture(false)
-        });
+        let result = recording.stop(
+            || Ok(()),
+            || {
+                self.capture_restores += 1;
+                if self.fail_capture_restore {
+                    return Err("injected capture restore failure".into());
+                }
+                self.set_capture(false)
+            },
+        );
         self.recording = recording;
         result
     }
@@ -343,7 +355,11 @@ fn failed_capture_restore_prevents_switch_and_retains_retry_ownership() {
     h.start_recording();
     h.fail_capture_restore = true;
     let original = h.current.clone();
-    assert!(h.run().err().unwrap().contains("capture-restoration-failed"));
+    assert!(h
+        .run()
+        .err()
+        .unwrap()
+        .contains("capture-restoration-failed"));
     h.assert_rejected(&original);
     assert!(h.admission.capture);
     h.fail_capture_restore = false;
