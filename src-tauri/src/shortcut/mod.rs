@@ -17,6 +17,13 @@ mod startup;
 pub(crate) mod switch;
 pub mod tauri_impl;
 
+// Disposable branch only: prove native test failures stop release dependencies.
+#[cfg(all(test, any(target_os = "windows", target_os = "macos")))]
+#[test]
+fn release_gate_disposable_failure_probe() {
+    panic!("INTENTIONAL_NATIVE_GATE_FAILURE: disposable verification branch only");
+}
+
 use log::{error, warn};
 use serde::Serialize;
 use specta::Type;
